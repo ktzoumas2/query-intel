@@ -131,6 +131,23 @@ End with a rewritten version of the full query incorporating all suggested fixes
 - After Step 1 if the query cannot be retrieved (bad query ID, no SQL provided)
 - After Step 5 for user review and follow-up questions
 
+## Iteration
+
+After presenting the report, the user may push back on specific findings or provide domain context
+that changes the analysis. Handle this naturally:
+
+- If the user says a flagged issue is not relevant (e.g., "that table only has 100 rows"),
+  accept the context, retract or downgrade the finding, and briefly explain why the revised
+  assessment differs.
+- If the user provides new information (e.g., column cardinality, business logic constraints,
+  typical data volumes), incorporate it and re-evaluate affected findings.
+- When revising, present only the changed findings -- do not re-present the entire report
+  unless the user asks for it.
+- If the user's feedback invalidates a fix in the consolidated rewrite, update the rewrite
+  to reflect only the remaining issues.
+- The user may also ask to go deeper on a specific finding. Expand with more detail, alternative
+  rewrites, or trade-off analysis as needed.
+
 ## Output
 
 A structured analysis with three sections (explanation, correctness, performance), concrete SQL rewrites for each issue, and an optional consolidated rewrite of the full query.
