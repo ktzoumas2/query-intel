@@ -7,7 +7,7 @@ description: "Analyze a SQL query for understanding, correctness, and performanc
 
 Analyze a Snowflake SQL query in three dimensions: **explanation**, **correctness**, and **performance**.
 
-**Scope constraint:** This skill performs **static analysis only**. Never execute the user's query or any rewritten version of it. The only SQL you may run is metadata retrieval (fetching query text from `QUERY_HISTORY`, object definitions via `GET_DDL`/`INFORMATION_SCHEMA`, and query profile stats from `GET_QUERY_OPERATOR_STATS`). All analysis is done by reading the SQL text, not by running it.
+**Scope constraint:** This skill performs **static analysis only**. Never execute the user's query or any rewritten version of it. The only SQL you may run is metadata retrieval (fetching query text from `QUERY_HISTORY`, object definitions via `GET_DDL`/`INFORMATION_SCHEMA`, query profile stats from `GET_QUERY_OPERATOR_STATS`, and `EXPLAIN` to obtain the query plan without execution). All analysis is done by reading the SQL text and its plan, not by running it.
 
 ## Workflow
 
@@ -35,6 +35,12 @@ If the user provides a query ID, also retrieve the query profile metadata when r
 ```sql
 SELECT *
 FROM TABLE(GET_QUERY_OPERATOR_STATS('<query_id>'))
+```
+
+When the user provides SQL text (not a query ID), use `EXPLAIN` to obtain the query plan -- this is a compile-time operation that does not execute the query or consume warehouse credits:
+
+```sql
+EXPLAIN USING TABULAR <query_text>
 ```
 
 These metadata queries are the **only** SQL you may execute. Never run the user's query itself or any rewrite of it.
@@ -80,7 +86,7 @@ If no correctness issues are found, say so explicitly.
 
 ### Step 4: Performance Review
 
-**Goal:** Flag performance anti-patterns and suggest improvements through static analysis of the SQL text. If query profile data was retrieved in Step 1 (from a query ID), incorporate those metrics. Do not execute the query or use EXPLAIN to obtain new profile data.
+**Goal:** Flag performance anti-patterns and suggest improvements through static analysis of the SQL text. If query profile data was retrieved in Step 1 (from a query ID), incorporate those metrics. If an `EXPLAIN` plan was retrieved, use it to inform join order, pruning estimates, and partition scanning analysis.
 
 **Check for these categories (non-exhaustive):**
 
