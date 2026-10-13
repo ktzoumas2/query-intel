@@ -406,3 +406,193 @@ FROM with_returns wr
 JOIN snowflake_public_data_free.public_data_free.company_index ci
   ON wr.TICKER = ci.PRIMARY_TICKER
 ORDER BY wr.TICKER, wr.DATE;
+
+
+-- =============================================================================
+-- FALSE-POSITIVE TESTS
+-- These queries look suspicious but are correct. The skill should produce
+-- no correctness findings (performance observations are acceptable).
+-- =============================================================================
+
+-- ---------------------------------------------------------------------------
+-- Q17  [False-positive: SELECT * where all columns are needed]
+-- NOT a bug: The CTE uses SELECT * from stock_price_timeseries, but the
+-- outer query references TICKER, DATE, VARIABLE, and VALUE — which are
+-- all the meaningful columns.  Flagging "SELECT * is wasteful" would be
+-- a false positive.
+-- ---------------------------------------------------------------------------
+WITH raw_prices AS (
+    SELECT *
+    FROM snowflake_public_data_free.public_data_free.stock_price_timeseries
+    WHERE TICKER = 'AAPL'
+      AND DATE >= '2023-01-01'
+)
+SELECT
+    rp.TICKER,
+    rp.DATE,
+    rp.VARIABLE,
+    rp.VALUE
+FROM raw_prices rp
+WHERE rp.VARIABLE IN ('nasdaq_open', 'nasdaq_close', 'nasdaq_volume')
+ORDER BY rp.DATE, rp.VARIABLE;
+
+
+-- ---------------------------------------------------------------------------
+-- Q18  [False-positive: UNION dedup is intentional]
+-- NOT a bug: The query finds geographic entities that appear in EITHER
+-- employment OR price datasets — a set union.  UNION ALL would produce
+-- duplicates for entities in both datasets, which is wrong for "which
+-- entities have any BLS coverage?" use case.
+-- ---------------------------------------------------------------------------
+SELECT GEO_ID, 'employment' AS dataset
+FROM snowflake_public_data_free.public_data_free.bureau_of_labor_statistics_employment_timeseries
+WHERE DATE = '2023-06-01'
+GROUP BY GEO_ID
+UNION   -- intentional: want distinct geo_ids across both datasets
+SELECT GEO_ID, 'prices' AS dataset
+FROM snowflake_public_data_free.public_data_free.bureau_of_labor_statistics_price_timeseries
+WHERE DATE = '2023-06-01'
+GROUP BY GEO_ID;
+
+
+-- ---------------------------------------------------------------------------
+-- Q19  [False-positive: NOT IN with non-nullable column]
+-- NOT a bug: GEO_ID in geography_index is the PK and is NOT NULL.
+-- The NOT IN subquery returns GEO_IDs at the 'State' level, which are
+-- always non-null.  The classic "NOT IN with NULLs" trap does not apply.
+-- ---------------------------------------------------------------------------
+SELECT
+    ts.GEO_ID,
+    SUM(ts.VALUE) AS total_value
+FROM snowflake_public_data_free.public_data_free.bureau_of_labor_statistics_employment_timeseries ts
+WHERE ts.DATE >= '2023-01-01'
+  AND ts.VARIABLE_NAME LIKE '%Unemployment Rate%'
+  AND ts.GEO_ID NOT IN (
+      SELECT g.GEO_ID
+      FROM snowflake_public_data_free.public_data_free.geography_index g
+      WHERE g.LEVEL = 'State'
+  )
+GROUP BY ts.GEO_ID
+ORDER BY total_value DESC
+LIMIT 20;
+
+
+-- ---------------------------------------------------------------------------
+-- Q20  [False-positive: COUNT(column) intentionally excludes NULLs]
+-- NOT a bug: The query counts total companies vs companies with a ticker.
+-- COUNT(PRIMARY_TICKER) intentionally excludes NULLs to count only publicly
+-- traded companies.  The difference reveals private companies.  Suggesting
+-- COUNT(*) would destroy the metric.
+-- ---------------------------------------------------------------------------
+SELECT
+    ci.PRIMARY_EXCHANGE_NAME,
+    COUNT(*)                        AS total_companies,
+    COUNT(ci.PRIMARY_TICKER)        AS public_companies,
+    COUNT(*) - COUNT(ci.PRIMARY_TICKER) AS private_companies
+FROM snowflake_public_data_free.public_data_free.company_index ci
+GROUP BY ci.PRIMARY_EXCHANGE_NAME
+ORDER BY private_companies DESC;
+
+
+-- =============================================================================
+-- BAD-REWRITE-TRAP TESTS
+-- These queries have a real issue, but the "obvious" fix changes semantics.
+-- The skill should either not suggest the naive fix, or should suggest a
+-- correct alternative that preserves the query's intent.
+-- =============================================================================
+
+-- ---------------------------------------------------------------------------
+-- Q21  [Bad-rewrite-trap: LEFT JOIN that looks like INNER but isn't]
+-- Issue: The WHERE clause filters on cc.RELATIONSHIP_TYPE (a right-side
+-- column), which normally converts a LEFT JOIN to an INNER JOIN.  The naive
+-- fix is "change to INNER JOIN".  But the OR branch (cc.RELATIONSHIP_TYPE
+-- IS NULL) deliberately keeps companies with no characteristics rows — it's
+-- how the query distinguishes "has industry data" from "no data available".
+-- Changing to INNER JOIN would drop all companies without characteristics.
+-- ---------------------------------------------------------------------------
+SELECT
+    ci.COMPANY_NAME,
+    ci.PRIMARY_TICKER,
+    cc.RELATIONSHIP_TYPE,
+    CASE
+        WHEN cc.RELATIONSHIP_TYPE IS NULL    THEN 'no_data'
+        WHEN cc.RELATIONSHIP_TYPE = 'NAICS'  THEN 'has_industry'
+        ELSE 'other'
+    END AS data_status
+FROM snowflake_public_data_free.public_data_free.company_index ci
+LEFT JOIN snowflake_public_data_free.public_data_free.company_characteristics cc
+  ON ci.COMPANY_ID = cc.COMPANY_ID
+WHERE (cc.RELATIONSHIP_TYPE = 'NAICS' OR cc.RELATIONSHIP_TYPE IS NULL)
+  AND ci.PRIMARY_TICKER IS NOT NULL
+ORDER BY ci.COMPANY_NAME
+LIMIT 50;
+
+
+-- ---------------------------------------------------------------------------
+-- Q22  [Bad-rewrite-trap: Non-aggregated column that is functionally dependent]
+-- Issue: GEO_NAME is in SELECT but not in GROUP BY.  Snowflake allows this.
+-- The naive fix is "add GEO_NAME to GROUP BY" or "wrap in MAX()".  But
+-- GEO_ID → GEO_NAME is a 1:1 functional dependency (each geo_id has
+-- exactly one name).  The correct fix is ANY_VALUE(g.GEO_NAME), which
+-- documents the intent.  Adding it to GROUP BY is harmless here but
+-- MAX() implies ordering semantics that don't apply to names.
+-- ---------------------------------------------------------------------------
+SELECT
+    ts.GEO_ID,
+    g.GEO_NAME,                                  -- not in GROUP BY
+    SUM(ts.VALUE)  AS total_value,
+    COUNT(*)       AS observation_count
+FROM snowflake_public_data_free.public_data_free.bureau_of_labor_statistics_employment_timeseries ts
+JOIN snowflake_public_data_free.public_data_free.geography_index g ON ts.GEO_ID = g.GEO_ID
+WHERE ts.DATE >= '2023-01-01'
+  AND ts.VARIABLE_NAME LIKE '%Unemployment Rate%'
+  AND g.LEVEL = 'State'
+GROUP BY ts.GEO_ID
+ORDER BY total_value DESC;
+
+
+-- ---------------------------------------------------------------------------
+-- Q23  [Bad-rewrite-trap: Correlated subquery where JOIN introduces fanout]
+-- Issue: The correlated subquery computes the latest close price per ticker.
+-- The naive fix is "rewrite as JOIN to stock_price_timeseries".  But a plain
+-- JOIN would create a 1:N fanout (many rows per ticker in stock_price),
+-- inflating the company_index rows.  The correct rewrite needs a
+-- pre-aggregated CTE or QUALIFY with ROW_NUMBER, not a bare JOIN.
+-- ---------------------------------------------------------------------------
+SELECT
+    ci.COMPANY_NAME,
+    ci.PRIMARY_TICKER,
+    ci.PRIMARY_EXCHANGE_NAME,
+    (SELECT MAX(sp.VALUE)
+     FROM snowflake_public_data_free.public_data_free.stock_price_timeseries sp
+     WHERE sp.TICKER = ci.PRIMARY_TICKER
+       AND sp.VARIABLE = 'nasdaq_close'
+       AND sp.DATE >= '2023-01-01'
+    ) AS max_close_2023
+FROM snowflake_public_data_free.public_data_free.company_index ci
+WHERE ci.PRIMARY_TICKER IS NOT NULL
+ORDER BY max_close_2023 DESC NULLS LAST
+LIMIT 20;
+
+
+-- ---------------------------------------------------------------------------
+-- Q24  [Bad-rewrite-trap: DISTINCT masking intentional many-to-many]
+-- Issue: DISTINCT is applied after joining employment timeseries to geography
+-- and attributes, where one GEO_ID can have multiple VARIABLE_NAMEs and one
+-- VARIABLE_NAME can appear in multiple REPORTs.  The naive fix is "remove
+-- DISTINCT and fix the join".  But the business question is "which unique
+-- (state, report) pairs have unemployment data?" — a set-of-pairs question.
+-- DISTINCT is the correct approach; removing it returns millions of rows.
+-- ---------------------------------------------------------------------------
+SELECT DISTINCT
+    g.GEO_NAME   AS state_name,
+    a.REPORT,
+    a.FREQUENCY
+FROM snowflake_public_data_free.public_data_free.bureau_of_labor_statistics_employment_timeseries ts
+JOIN snowflake_public_data_free.public_data_free.geography_index g
+  ON ts.GEO_ID = g.GEO_ID
+JOIN snowflake_public_data_free.public_data_free.bureau_of_labor_statistics_employment_attributes a
+  ON ts.VARIABLE_NAME = a.VARIABLE_NAME
+WHERE g.LEVEL = 'State'
+  AND ts.DATE >= '2023-01-01'
+ORDER BY state_name, a.REPORT;
